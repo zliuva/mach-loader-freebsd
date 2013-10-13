@@ -4,7 +4,7 @@ LDFLAGS = -macosx_version_min 10.7
 AS = as
 LD = ld
 
-C_BINS = hello getpid
+C_BINS = hello getpid args
 ASM_BINS = hello_asm
 
 all: $(C_BINS) $(ASM_BINS)
@@ -23,6 +23,7 @@ clean:
 
 hello: hello.c
 getpid: getpid.c
+args: args.c
 hello_asm: hello.o
 hello.o: hello.S
 
