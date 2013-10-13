@@ -1,4 +1,4 @@
-CC = cc
+CC = clang
 CPPFLAGS = -I./include
 CFLAGS = -std=c99
 
