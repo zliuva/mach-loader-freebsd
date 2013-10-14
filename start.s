@@ -63,7 +63,7 @@
 	.align 2
 
 crt0_start:
-	popq	%rax
+	popq	%rax		# since we have a call from the loader, pop the return address
 	pushq	$0		    # push a zero for debugger end of frames marker
 	movq	%rsp,%rbp	    # pointer to base of kernel frame
 	andq    $-16,%rsp	    # force SSE alignment
@@ -81,6 +81,7 @@ crt0_start:
 	add	$8,%rcx		    # once found, next pointer is "apple" parameter now in %rcx
 	call	*%r15
 	movl	%eax,%edi	    # pass result from main() to exit() 
-	call	_exit		    # need to use call to keep stack aligned
+	#call	_exit		    # need to use call to keep stack aligned
+	call	exit		    # call the libc exit (note that Apple prepends a "_", the intention was to call libc's exit, _exit is the syscall (in OS X it would be __exit))
 	hlt
 

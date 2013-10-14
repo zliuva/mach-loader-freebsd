@@ -224,6 +224,9 @@ do_bind:
 								LOGF("Binding %s (seg: %lu, offset: 0x%lx)... @%p -> %p\n",
 									 symbol_name, seg_index, seg_offset, vmaddr, func_ptr);
 
+								// advance the address, this is done so binding for the immidiate next pointer
+								// in __DATA does not require another SET_SEGMENT_AND_OFFSET_ULEB
+								// usually used for non-lazy binding
 								vmaddr++;
 								break;
 
