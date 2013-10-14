@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <assert.h>
 
@@ -16,7 +17,7 @@
 #ifdef NDEBUG
 	#define LOGF(...)
 #else
-	#define LOGF fprintf
+	#define LOGF(...) fprintf(stderr, __VA_ARGS__)
 #endif
 
 #define MAX_SEGMENTS 255
@@ -24,7 +25,10 @@
 static int fd_image = -1;
 
 struct segment_command_64 *segments[MAX_SEGMENTS];
+struct segment_command_64 *text_seg = NULL;
 static int current_seg = -1;
+
+extern void osx_start();
 
 static uint64_t read_uleb128(const uint8_t** p, const uint8_t* end) {
 	uint64_t result = 0;
@@ -47,16 +51,20 @@ static uint64_t read_uleb128(const uint8_t** p, const uint8_t* end) {
 
 int load_segment(struct load_command *command) {
 	struct segment_command_64 *seg_command = (struct segment_command_64 *) command;
-	LOGF(stderr, "Loading segment %s: ", seg_command->segname);
+	LOGF("Loading segment %s: ", seg_command->segname);
 
 	segments[++current_seg] = seg_command;
 
 	if (strcmp(seg_command->segname, SEG_PAGEZERO) == 0) {
-		LOGF(stderr, "ignored.\n");
+		LOGF("ignored.\n");
 		return 0;
 	}
 
-	LOGF(stderr, "Mapping 0x%lx(0x%lx) to 0x%lx(0x%lx): ",
+	if (strcmp(seg_command->segname, SEG_TEXT) == 0) {
+		text_seg = seg_command;
+	}
+
+	LOGF("Mapping 0x%lx(0x%lx) to 0x%lx(0x%lx): ",
 			seg_command->fileoff, seg_command->filesize,
 			seg_command->vmaddr, seg_command->vmsize);
 
@@ -65,15 +73,15 @@ int load_segment(struct load_command *command) {
 	assert(VM_PROT_EXECUTE == PROT_EXEC);
 
 	if (seg_command->initprot & PROT_READ) {
-		LOGF(stderr, "R");
+		LOGF("R");
 	}
 	if (seg_command->initprot & PROT_WRITE) {
-		LOGF(stderr, "W");
+		LOGF("W");
 	}
 	if (seg_command->initprot & PROT_EXEC) {
-		LOGF(stderr, "X");
+		LOGF("X");
 	}
-	LOGF(stderr, "\n");
+	LOGF("\n");
 
 	void *segment = mmap((void *) seg_command->vmaddr, seg_command->vmsize,
 						 seg_command->initprot,
@@ -108,7 +116,7 @@ int load_segment(struct load_command *command) {
 				strncmp(text + 7, syscall, 2) == 0 &&
 				text[6] == 0x02) {
 				text[6] = 0x00;
-				LOGF(stderr, "Syscall %d patched\n", *((int *) (text + 3)));
+				LOGF("Syscall %d patched\n", *((int *) (text + 3)));
 				text += 9;
 			}
 
@@ -136,12 +144,14 @@ int main(int argc, char **argv, char **envp) {
 	assert(header->filetype == MH_EXECUTE);
 
 	struct x86_thread_state *thread_state;
+	uint64_t entry_point;
+	bool is_lc_main = false;
 
 	struct load_command *command = (struct load_command *) (header + 1);
 
 #define IGNORE_COMMAND(command) \
 		case command: \
-			LOGF(stderr, "Load command %d ignored: %s\n", i, #command); \
+			LOGF("Load command %d ignored: %s\n", i, #command); \
 			break
 
 	for (int i = 0; i < header->ncmds; i++) {
@@ -164,8 +174,11 @@ int main(int argc, char **argv, char **envp) {
 			IGNORE_COMMAND(LC_SUB_LIBRARY);
 			IGNORE_COMMAND(LC_SUB_CLIENT);
 			IGNORE_COMMAND(LC_VERSION_MIN_MACOSX);
+			IGNORE_COMMAND(LC_SOURCE_VERSION);
 			IGNORE_COMMAND(LC_FUNCTION_STARTS);
 			IGNORE_COMMAND(LC_DATA_IN_CODE);
+			IGNORE_COMMAND(LC_DYLIB_CODE_SIGN_DRS);
+			IGNORE_COMMAND(LC_CODE_SIGNATURE);
 
 			case LC_SEGMENT_64:
 				load_segment(command);
@@ -207,7 +220,7 @@ int main(int argc, char **argv, char **envp) {
 								func_ptr = dlsym(RTLD_DEFAULT, symbol_name + 1); // +1 to remove the "_"
 								*vmaddr = (uint64_t) func_ptr;
 
-								LOGF(stderr, "Binding %s (seg: %lu, offset: 0x%lx)... @0x%lx -> %p\n",
+								LOGF("Binding %s (seg: %lu, offset: 0x%lx)... @%p -> %p\n",
 									 symbol_name, seg_index, seg_offset, vmaddr, func_ptr);
 								break;
 
@@ -219,14 +232,22 @@ int main(int argc, char **argv, char **envp) {
 				break;
 
 			case LC_UNIXTHREAD:
-				LOGF(stderr, "Processing LC_UNIXTHREAD... ");
+				LOGF("Processing LC_UNIXTHREAD... ");
 				thread_state = (struct x86_thread_state *) (command + 1);
 				assert(thread_state->tsh.flavor == x86_THREAD_STATE64);
-				LOGF(stderr, "RIP: 0x%lx\n", thread_state->uts.ts64.rip);
+				entry_point = thread_state->uts.ts64.rip;
+				LOGF("Entry Point: 0x%lx\n", entry_point);
+				break;
+
+			case LC_MAIN:
+				LOGF("Processing LC_MAIN... ");
+				entry_point = text_seg->vmaddr + ((struct entry_point_command *) command)->entryoff;
+				is_lc_main = true;
+				LOGF("Entry Point: 0x%lx\n", entry_point);
 				break;
 
 			default:
-				LOGF(stderr, "Load command %d unknown: %d\n", i, command->cmd);
+				LOGF("Load command %d unknown: %d\n", i, command->cmd);
 				break;
 		}
 
@@ -235,15 +256,97 @@ int main(int argc, char **argv, char **envp) {
 	
 	close(fd_image);
 
-	__asm__("pushq $0x0"); //argc
-	__asm__("pushq $0x0"); //argv
-	__asm__("pushq $0x0"); //envp
-	__asm__("pushq $0x0"); //apple
+	// set up the stack
+	// figure from http://www.opensource.apple.com/source/Csu/Csu-79/start.s
+	/*
+	 * C runtime startup for ppc, ppc64, i386, x86_64
+	 *
+	 * Kernel sets up stack frame to look like:
+	 *
+	 *	       :
+	 *	| STRING AREA |
+	 *	+-------------+
+	 *	|      0      |	
+	 *	+-------------+	
+	 *	|  exec_path  | extra "apple" parameters start after NULL terminating env array
+	 *	+-------------+
+	 *	|      0      |
+	 *	+-------------+
+	 *	|    env[n]   |
+	 *	+-------------+
+	 *	       :
+	 *	       :
+	 *	+-------------+
+	 *	|    env[0]   |
+	 *	+-------------+
+	 *	|      0      |
+	 *	+-------------+
+	 *	| arg[argc-1] |
+	 *	+-------------+
+	 *	       :
+	 *	       :
+	 *	+-------------+
+	 *	|    arg[0]   |
+	 *	+-------------+
+	 *	|     argc    | argc is always 4 bytes long, even in 64-bit architectures
+	 *	+-------------+ <- sp
+	 *
+	 *	Where arg[i] and env[i] point into the STRING AREA
+	 */
 
-	__asm__("jmpq *%0"
-			:
-			:"r"(thread_state->uts.ts64.rip)
-		   );
+	char **envp_end = envp;
+	while (*envp_end) envp_end++;
 
+	__asm__ __volatile__ (
+		"movq	%0, %%rax\n"	// argc
+		"movq	%1, %%rbx\n"	// argv (set to argv + 1 to remove the loader itself)
+		"movq	%2, %%rcx\n"	// end of argv (the NULL)
+		"movq	%3, %%rdx\n"	// envp
+		"movq	%4, %%rdi\n"	// end of envp (the NULL)
+		"movq	%5, %%rsi\n"	// entry point
+		"movq	%6, %%r15\n"
+		// apple
+		"pushq	$0\n"			// NULL
+		"pushq	(%%rbx)\n"		// argv[0] as apple[0], stack gurad etc. ignored
+		// envp
+		"pushq	$0\n"			// NULL
+		".Lenvp:\n"
+		"subq	$8, %%rdi\n"
+		"pushq	(%%rdi)\n"
+		"cmpq	%%rdi, %%rdx\n"
+		"jne	.Lenvp\n"
+		// argv
+		"pushq	$0\n"			// NULL
+		".Largv:\n"
+		"subq	$8, %%rcx\n"
+		"pushq	(%%rcx)\n"
+		"cmpq	%%rcx, %%rbx\n"
+		"jne	.Largv\n"
+		// argc
+		"pushq	%%rax\n"
+
+		"testq	%%r15, %%r15\n"
+		"jne	.LLC_MAIN\n"
+		
+		// LC_UNIX_THREAD
+		// since we just set up the stack, this must be jmp (not call) so RSP is correct
+		"jmpq	*%%rsi\n"
+
+		// LC_MAIN
+		// LC_MAIN requires stub in dyld and libdyld
+		// temporary workaround: embed a crt0 stub in the loader
+		".LLC_MAIN:\n"
+		"movq	%%rsi, %%r15\n"
+		"callq	crt0_start\n"
+		:
+		: "r"((uint64_t) argc - 1),
+		  "r"(argv + 1),
+		  "r"(argv + argc),
+		  "r"(envp),
+		  "r"(envp_end),
+		  "r"(entry_point),
+		  "r"((uint64_t) is_lc_main)
+		: "rax", "rbx", "rcx", "rdx", "rdi", "rsi", "r15"
+	);
 }
 

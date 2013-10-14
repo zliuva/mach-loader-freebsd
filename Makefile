@@ -1,4 +1,5 @@
 CC = clang
+AS = as
 CPPFLAGS = -I./include
 CFLAGS = -std=c99
 
@@ -11,17 +12,20 @@ CFLAGS += -O3 -fno-omit-frame-pointer -DNDEBUG
 debug: all
 all: loader
 
-loader: loader.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $<
+loader: loader.c start.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< start.o
+
+start.o: start.s
+	$(AS) -o $@ $<
 
 run: loader
-	./loader test/hello_mach
+	./loader test/hello_asm
 
 run_c: loader
-	./loader test/hello_c_mach
+	./loader test/hello
 
 run_all: loader
-	@for BIN in test/*; do\
+	-@for BIN in test/*; do\
 		if [ -x $$BIN ]; then\
 			echo "Testing $$BIN...";\
 			./loader $$BIN;\
