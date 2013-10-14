@@ -194,11 +194,12 @@ int main(int argc, char **argv, char **envp) {
 					void *func_ptr = NULL;
 					char *symbol_name;
 
-					// handles only lazy bind (libc) funcs for now
-					const uint8_t * const start = (uint8_t *) header + info_command->lazy_bind_off;
-					const uint8_t * const end = start + info_command->lazy_bind_size;
+					bool lazy_bind = false;
+					const uint8_t * start = (uint8_t *) header + info_command->bind_off;
+					const uint8_t * end = start + info_command->bind_size;
 					const uint8_t *p = start;
 
+do_bind:
 					while (p < end) {
 						uint8_t immediate = *p & BIND_IMMEDIATE_MASK;
 						uint8_t opcode = *p & BIND_OPCODE_MASK;
@@ -208,6 +209,7 @@ int main(int argc, char **argv, char **envp) {
 							case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
 								seg_index = immediate;
 								seg_offset = read_uleb128(&p, end);
+								vmaddr = (uint64_t *) (segments[seg_index]->vmaddr + seg_offset);
 								break;
 
 							case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
@@ -216,17 +218,28 @@ int main(int argc, char **argv, char **envp) {
 								break;
 
 							case BIND_OPCODE_DO_BIND:
-								vmaddr = (uint64_t *) (segments[seg_index]->vmaddr + seg_offset);
 								func_ptr = dlsym(RTLD_DEFAULT, symbol_name + 1); // +1 to remove the "_"
 								*vmaddr = (uint64_t) func_ptr;
 
 								LOGF("Binding %s (seg: %lu, offset: 0x%lx)... @%p -> %p\n",
 									 symbol_name, seg_index, seg_offset, vmaddr, func_ptr);
+
+								vmaddr++;
 								break;
 
 							default:
 								break;
 						}
+					}
+
+					if (!lazy_bind) {
+						lazy_bind = true;
+
+						start = (uint8_t *) header + info_command->lazy_bind_off;
+						end = start + info_command->lazy_bind_size;
+						p = start;
+
+						goto do_bind;
 					}
 				}
 				break;
