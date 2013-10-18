@@ -59,29 +59,72 @@
  */
 
 	.text
-	.globl crt0_start
+	.globl boot
 	.align 2
 
+/**
+ * rdi: argc
+ * rsi: argv
+ * rdx: envp
+ * rcx: end of envp
+ * r8:  entry point
+ * r9:  is_lc_main
+ */
+boot:
+	# apple
+	pushq	$0			# NULL
+	pushq	(%rsi)		# argv[0] as apple[0], stack gurad etc. ignored
+	# envp
+	pushq	$0			# NULL
+	.Lenvp:
+	subq	$8, %rcx
+	pushq	(%rcx)
+	cmpq	%rdx, %rcx
+	jne	.Lenvp
+	# argv
+	movq	%rdi, %rax	# rax = argc
+	salq	$3, %rax	# rax *= 8
+	addq	%rsi, %rax	# rax += argv (rax now holds end of argv)
+	pushq	$0			# NULL
+	.Largv:
+	subq	$8, %rax
+	pushq	(%rax)
+	cmpq	%rsi, %rax
+	jne	.Largv
+	# argc
+	pushq	%rdi
+
+	testq	%r9, %r9
+	jne		crt0_start
+	
+	# LC_UNIX_THREAD
+	# since we just set up the stack, this must be jmp (not call) so RSP is correct
+	jmpq	*%r8
+
+	# LC_MAIN
+	# LC_MAIN requires stub in dyld and libdyld
+	# temporary workaround: embed a crt0 stub in the loader
 crt0_start:
-	popq	%rax		# since we have a call from the loader, pop the return address
-	pushq	$0		    # push a zero for debugger end of frames marker
-	movq	%rsp,%rbp	    # pointer to base of kernel frame
-	andq    $-16,%rsp	    # force SSE alignment
-	movq	8(%rbp),%rdi	    # put argc in %rdi
-	leaq	16(%rbp),%rsi	    # addr of arg[0], argv, into %rsi
-	movl	%edi,%edx	    # copy argc into %rdx
-	addl	$1,%edx		    # argc + 1 for zero word
-	sall	$3,%edx		    # * sizeof(char *)
-	addq	%rsi,%rdx	    # addr of env[0], envp, into %rdx
-	movq	%rdx,%rcx
-	jmp	.Lapple2
-.Lapple:	add	$8,%rcx
-.Lapple2:cmpq	$0,(%rcx)	    # look for NULL ending env[] array
-	jne	.Lapple		    
-	add	$8,%rcx		    # once found, next pointer is "apple" parameter now in %rcx
-	call	*%r15
-	movl	%eax,%edi	    # pass result from main() to exit() 
-	#call	_exit		    # need to use call to keep stack aligned
-	call	exit		    # call the libc exit (note that Apple prepends a "_", the intention was to call libc's exit, _exit is the syscall (in OS X it would be __exit))
+	pushq	$0				# push a zero for debugger end of frames marker
+	movq	%rsp, %rbp		# pointer to base of kernel frame
+	andq	$-16, %rsp		# force SSE alignment
+	movq	8(%rbp), %rdi	# put argc in %rdi
+	leaq	16(%rbp), %rsi	# addr of arg[0], argv, into %rsi
+	movl	%edi, %edx		# copy argc into %rdx
+	addl	$1, %edx		# argc + 1 for zero word
+	sall	$3, %edx		# * sizeof(char *)
+	addq	%rsi, %rdx		# addr of env[0], envp, into %rdx
+	movq	%rdx, %rcx
+	jmp		.Lapple2
+.Lapple:
+	add		$8, %rcx
+.Lapple2:
+	cmpq	$0, (%rcx)		# look for NULL ending env[] array
+	jne		.Lapple				
+	add		$8, %rcx		# once found, next pointer is "apple" parameter now in %rcx
+	call	*%r8
+	movl	%eax, %edi		# pass result from main() to exit() 
+	#call	_exit			# need to use call to keep stack aligned
+	call	exit			# call the libc exit (note that Apple prepends a "_", the intention was to call libc's exit, _exit is the syscall (in OS X it would be __exit))
 	hlt
 

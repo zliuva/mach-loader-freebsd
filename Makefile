@@ -6,16 +6,16 @@ CFLAGS = -std=c99
 .if defined(DEBUG) || make(debug)
 CFLAGS += -O0 -g
 .else
-CFLAGS += -O3 -fno-omit-frame-pointer -DNDEBUG
+CFLAGS += -O3 -DNDEBUG
 .endif
 
 debug: all
 all: loader
 
-loader: loader.c start.o
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< start.o
+loader: loader.c boot.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< boot.o
 
-start.o: start.s
+boot.o: boot.s
 	$(AS) -o $@ $<
 
 run: loader
@@ -35,5 +35,6 @@ run_all: loader
 
 clean:
 	rm -f loader
+	rm -f *.o
 	rm -f *.core
 

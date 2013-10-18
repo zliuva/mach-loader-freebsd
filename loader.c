@@ -28,7 +28,7 @@ struct segment_command_64 *segments[MAX_SEGMENTS];
 struct segment_command_64 *text_seg = NULL;
 static int current_seg = -1;
 
-extern void osx_start();
+extern void boot(uint64_t argc, char **argv, char **envp, char **envp_end, uint64_t entry, uint64_t is_lc_main);
 
 static uint64_t read_uleb128(const uint8_t** p, const uint8_t* end) {
 	uint64_t result = 0;
@@ -108,8 +108,8 @@ int load_segment(struct load_command *command) {
 	if (strcmp(seg_command->segname, SEG_TEXT) == 0) {
 		mprotect(segment, seg_command->vmsize, seg_command->initprot | PROT_WRITE);
 
-		const char *mov_rax = "\x48\xc7\xc0";
-		const char *syscall = "\x0f\x05";
+		const char * const mov_rax = "\x48\xc7\xc0";
+		const char * const syscall = "\x0f\x05";
 		char *text = segment;
 		while (text < (char *) segment + seg_command->vmsize) {
 			if (strncmp(text, mov_rax, 3) == 0 &&
@@ -272,97 +272,9 @@ do_bind:
 	
 	close(fd_image);
 
-	// set up the stack
-	// figure from http://www.opensource.apple.com/source/Csu/Csu-79/start.s
-	/*
-	 * C runtime startup for ppc, ppc64, i386, x86_64
-	 *
-	 * Kernel sets up stack frame to look like:
-	 *
-	 *	       :
-	 *	| STRING AREA |
-	 *	+-------------+
-	 *	|      0      |	
-	 *	+-------------+	
-	 *	|  exec_path  | extra "apple" parameters start after NULL terminating env array
-	 *	+-------------+
-	 *	|      0      |
-	 *	+-------------+
-	 *	|    env[n]   |
-	 *	+-------------+
-	 *	       :
-	 *	       :
-	 *	+-------------+
-	 *	|    env[0]   |
-	 *	+-------------+
-	 *	|      0      |
-	 *	+-------------+
-	 *	| arg[argc-1] |
-	 *	+-------------+
-	 *	       :
-	 *	       :
-	 *	+-------------+
-	 *	|    arg[0]   |
-	 *	+-------------+
-	 *	|     argc    | argc is always 4 bytes long, even in 64-bit architectures
-	 *	+-------------+ <- sp
-	 *
-	 *	Where arg[i] and env[i] point into the STRING AREA
-	 */
-
 	char **envp_end = envp;
 	while (*envp_end) envp_end++;
 
-	__asm__ __volatile__ (
-		"movq	%0, %%rax\n"	// argc
-		"movq	%1, %%rbx\n"	// argv (set to argv + 1 to remove the loader itself)
-		"movq	%2, %%rcx\n"	// end of argv (the NULL)
-		"movq	%3, %%rdx\n"	// envp
-		"movq	%4, %%rdi\n"	// end of envp (the NULL)
-		"movq	%5, %%rsi\n"	// entry point
-		"movq	%6, %%r15\n"
-		// apple
-		"pushq	$0\n"			// NULL
-		"pushq	(%%rbx)\n"		// argv[0] as apple[0], stack gurad etc. ignored
-		// envp
-		"pushq	$0\n"			// NULL
-		".Lenvp:\n"
-		"subq	$8, %%rdi\n"
-		"pushq	(%%rdi)\n"
-		"cmpq	%%rdi, %%rdx\n"
-		"jne	.Lenvp\n"
-		// argv
-		"pushq	$0\n"			// NULL
-		".Largv:\n"
-		"subq	$8, %%rcx\n"
-		"pushq	(%%rcx)\n"
-		"cmpq	%%rcx, %%rbx\n"
-		"jne	.Largv\n"
-		// argc
-		"pushq	%%rax\n"
-
-		"testq	%%r15, %%r15\n"
-		"jne	.LLC_MAIN\n"
-		
-		// LC_UNIX_THREAD
-		// since we just set up the stack, this must be jmp (not call) so RSP is correct
-		"jmpq	*%%rsi\n"
-
-		// LC_MAIN
-		// LC_MAIN requires stub in dyld and libdyld
-		// temporary workaround: embed a crt0 stub in the loader
-		".LLC_MAIN:\n"
-		"movq	%%rsi, %%r15\n"
-		"callq	crt0_start\n"
-		:
-		: "r"((uint64_t) argc - 1),
-		  "r"(argv + 1),
-		  "r"(argv + argc),
-		  "r"(envp),
-		  "r"(envp_end),
-		  "r"(entry_point),
-		  "r"((uint64_t) is_lc_main)
-		: "rax", "rbx", "rcx", "rdx", "rdi", "rsi", "r15"
-	);
+	boot(argc - 1, argv + 1, envp, envp_end, entry_point, is_lc_main);
 }
 
