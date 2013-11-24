@@ -12,11 +12,14 @@ CFLAGS += -O3 -DNDEBUG
 debug: all
 all: loader
 
-loader: loader.c boot.o
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< boot.o
+loader: loader.c boot.o dyld_stub_binder.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< boot.o dyld_stub_binder.o
 
 boot.o: boot.s
 	$(AS) -o $@ $<
+
+dyld_stub_binder.o: dyld_stub_binder.S
+	$(CC) -c -o $@ $<
 
 run: loader
 	./loader test/hello_asm

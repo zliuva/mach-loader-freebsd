@@ -24,11 +24,16 @@
 
 static int fd_image = -1;
 
+struct mach_header_64 *header;
+
 struct segment_command_64 *segments[MAX_SEGMENTS];
 struct segment_command_64 *text_seg = NULL;
 static int current_seg = -1;
 
+struct dyld_info_command *dyld_info;
+
 extern void boot(uint64_t argc, char **argv, char **envp, char **envp_end, uint64_t entry, uint64_t is_lc_main);
+extern void dyld_stub_binder(void);
 
 static uint64_t read_uleb128(const uint8_t** p, const uint8_t* end) {
 	uint64_t result = 0;
@@ -129,6 +134,66 @@ int load_segment(struct load_command *command) {
 	return 0;
 }
 
+uint64_t dyld_stub_binder_impl(void** image_loader_cache, uint64_t lazy_offset) {
+	uint64_t seg_index = -1;
+	uint64_t seg_offset = -1;
+	uint64_t *vmaddr = NULL;
+	void *func_ptr = NULL;
+	char *symbol_name;
+
+	const uint8_t * const start = (uint8_t *) header + dyld_info->lazy_bind_off + lazy_offset;
+	const uint8_t * const end = start + dyld_info->lazy_bind_size;
+	const uint8_t *p = start;
+
+	bool done = false;
+
+	while (!done && p < end) {
+		uint8_t immediate = *p & BIND_IMMEDIATE_MASK;
+		uint8_t opcode = *p & BIND_OPCODE_MASK;
+		p++;
+
+		switch (opcode) {
+			case BIND_OPCODE_DONE:
+				done = true;
+				break;
+
+			case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
+				seg_index = immediate;
+				seg_offset = read_uleb128(&p, end);
+				vmaddr = (uint64_t *) (segments[seg_index]->vmaddr + seg_offset);
+				break;
+
+			case BIND_OPCODE_ADD_ADDR_ULEB:
+				vmaddr = (uint64_t *) ((uint64_t) vmaddr + read_uleb128(&p, end));
+				break;
+
+			case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
+				symbol_name = (char *) p;
+				while (*p++);
+				break;
+
+			case BIND_OPCODE_DO_BIND:
+				func_ptr = dlsym(RTLD_DEFAULT, symbol_name + 1); // +1 to remove the "_"
+
+				*vmaddr = (uint64_t) func_ptr;
+
+				LOGF("Lazy Binding %s (seg: %lu, offset: 0x%lx)... @%p -> %p\n",
+					 symbol_name, seg_index, seg_offset, vmaddr, func_ptr);
+
+				// advance the address, this is done so binding for the immidiate next pointer
+				// in __DATA does not require another SET_SEGMENT_AND_OFFSET_ULEB
+				// usually used for non-lazy binding
+				vmaddr++;
+				break;
+
+			default:
+				break;
+		}
+	}
+
+	return (uint64_t) func_ptr;
+}
+
 int main(int argc, char **argv, char **envp) {
 	const char *fname = argv[1];
 
@@ -137,7 +202,7 @@ int main(int argc, char **argv, char **envp) {
 	struct stat sb;
 	fstat(fd_image, &sb);
 
-	struct mach_header_64 *header = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd_image, 0);
+	header = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd_image, 0);
 
 	assert(header->magic == MH_MAGIC_64);
 	assert(header->cputype == CPU_TYPE_X86_64);
@@ -186,7 +251,7 @@ int main(int argc, char **argv, char **envp) {
 
 			case LC_DYLD_INFO_ONLY:
 				{
-					struct dyld_info_command *info_command = (struct dyld_info_command *) command;
+					dyld_info = (struct dyld_info_command *) command;
 
 					uint64_t seg_index = -1;
 					uint64_t seg_offset = -1;
@@ -194,12 +259,10 @@ int main(int argc, char **argv, char **envp) {
 					void *func_ptr = NULL;
 					char *symbol_name;
 
-					bool lazy_bind = false;
-					const uint8_t * start = (uint8_t *) header + info_command->bind_off;
-					const uint8_t * end = start + info_command->bind_size;
+					const uint8_t *start = (uint8_t *) header + dyld_info->bind_off;
+					const uint8_t *end = start + dyld_info->bind_size;
 					const uint8_t *p = start;
 
-do_bind:
 					while (p < end) {
 						uint8_t immediate = *p & BIND_IMMEDIATE_MASK;
 						uint8_t opcode = *p & BIND_OPCODE_MASK;
@@ -212,13 +275,22 @@ do_bind:
 								vmaddr = (uint64_t *) (segments[seg_index]->vmaddr + seg_offset);
 								break;
 
+							case BIND_OPCODE_ADD_ADDR_ULEB:
+								vmaddr = (uint64_t *) ((uint64_t) vmaddr + read_uleb128(&p, end));
+								break;
+
 							case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
 								symbol_name = (char *) p;
 								while (*p++);
 								break;
 
 							case BIND_OPCODE_DO_BIND:
-								func_ptr = dlsym(RTLD_DEFAULT, symbol_name + 1); // +1 to remove the "_"
+								if (strncmp("dyld_stub_binder", symbol_name, 16) == 0) {
+									func_ptr = dyld_stub_binder;
+								} else {
+									func_ptr = dlsym(RTLD_DEFAULT, symbol_name + 1); // +1 to remove the "_"
+								}
+
 								*vmaddr = (uint64_t) func_ptr;
 
 								LOGF("Binding %s (seg: %lu, offset: 0x%lx)... @%p -> %p\n",
@@ -233,16 +305,6 @@ do_bind:
 							default:
 								break;
 						}
-					}
-
-					if (!lazy_bind) {
-						lazy_bind = true;
-
-						start = (uint8_t *) header + info_command->lazy_bind_off;
-						end = start + info_command->lazy_bind_size;
-						p = start;
-
-						goto do_bind;
 					}
 				}
 				break;

@@ -1,2 +1,4 @@
 loader
 *.o
+test/*
+
