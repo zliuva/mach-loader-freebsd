@@ -22,6 +22,8 @@
 
 #define MAX_SEGMENTS 255
 
+#define PAGE_SIZE getpagesize()
+
 static int fd_image = -1;
 
 struct mach_header_64 *header;
@@ -92,7 +94,9 @@ int load_segment(struct load_command *command) {
 	}
 	LOGF("\n");
 
-	void *segment = mmap((void *) seg_command->vmaddr, seg_command->vmsize,
+	// it seems on FreeBSD mmap aligns to page boundaries
+	uint64_t aligned_size = (seg_command->filesize + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
+	void *segment = mmap((void *) seg_command->vmaddr, aligned_size,
 						 seg_command->initprot,
 						 MAP_PRIVATE | MAP_FIXED,
 						 fd_image, seg_command->fileoff);
@@ -103,14 +107,14 @@ int load_segment(struct load_command *command) {
 
 	assert(segment == (void *) seg_command->vmaddr);
 
-	// the loader guarantees these bytes are 0
-	if (seg_command->vmsize > seg_command->filesize) {
-		void *zeros = (void *) (seg_command->vmaddr + seg_command->filesize);
-		int n_zeros = seg_command->vmsize - seg_command->filesize;
-
-		mprotect(segment, seg_command->vmsize, seg_command->initprot | PROT_WRITE);
-		memset(zeros, 0, n_zeros);
-		mprotect(segment, seg_command->vmsize, seg_command->initprot);
+	// if there's any left over, map it ourselves (it seems mmap zero-fills it too);
+	if (seg_command->vmsize > aligned_size) {
+		int n_zeros = seg_command->vmsize - aligned_size;
+		void *zeros = mmap((void *) (seg_command->vmaddr + aligned_size), n_zeros,
+						   seg_command->initprot,
+						   MAP_ANON | MAP_PRIVATE | MAP_FIXED,
+						   -1, 0);
+		assert(zeros == (void *) (seg_command->vmaddr + aligned_size));
 	}
 
 	// patch syscall
@@ -185,9 +189,15 @@ uint64_t dyld_stub_binder_impl(void** image_loader_cache, uint64_t lazy_offset) 
 					}
 
 					func_ptr = dlsym(RTLD_DEFAULT, bsd_symbol_name); // +1 to remove the "_"
-					if (strncmp("_compat_mode", symbol_name, 12) == 0) {
-						func_ptr = compat_mode;
-					}
+
+#define REPLACE(osx_symbol, bsd_symbol) \
+if (strcmp(#osx_symbol, symbol_name) == 0) { \
+	func_ptr = bsd_symbol; \
+}
+
+					REPLACE(_compat_mode, compat_mode);
+					REPLACE(___strlcpy_chk, strlcpy);
+					REPLACE(___snprintf_chk, snprintf);
 
 					*vmaddr = (uint64_t) func_ptr;
 
