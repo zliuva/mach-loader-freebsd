@@ -2,6 +2,7 @@ CC = clang
 AS = as
 CPPFLAGS = -I./include
 CFLAGS = -std=c99
+LDFLAGS = -lm
 
 .if defined(DEBUG) || make(debug)
 CFLAGS += -O0 -g
@@ -13,7 +14,7 @@ debug: all
 all: loader
 
 loader: loader.c boot.o dyld_stub_binder.o
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< boot.o dyld_stub_binder.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< boot.o dyld_stub_binder.o
 
 boot.o: boot.s
 	$(AS) -o $@ $<

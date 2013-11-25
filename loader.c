@@ -35,6 +35,10 @@ struct dyld_info_command *dyld_info;
 extern void boot(uint64_t argc, char **argv, char **envp, char **envp_end, uint64_t entry, uint64_t is_lc_main);
 extern void dyld_stub_binder(void);
 
+bool compat_mode(void) {
+	return true;
+}
+
 static uint64_t read_uleb128(const uint8_t** p, const uint8_t* end) {
 	uint64_t result = 0;
 	int		 bit = 0;
@@ -173,17 +177,30 @@ uint64_t dyld_stub_binder_impl(void** image_loader_cache, uint64_t lazy_offset) 
 				break;
 
 			case BIND_OPCODE_DO_BIND:
-				func_ptr = dlsym(RTLD_DEFAULT, symbol_name + 1); // +1 to remove the "_"
+				{
+					char *bsd_symbol_name = strdup(symbol_name + 1); // +1 to remove the "_"
+					char *inode_64 = strstr(bsd_symbol_name, "$INODE64");
+					if (inode_64) {
+						*inode_64 = '\0';
+					}
 
-				*vmaddr = (uint64_t) func_ptr;
+					func_ptr = dlsym(RTLD_DEFAULT, bsd_symbol_name); // +1 to remove the "_"
+					if (strncmp("_compat_mode", symbol_name, 12) == 0) {
+						func_ptr = compat_mode;
+					}
 
-				LOGF("Lazy Binding %s (seg: %lu, offset: 0x%lx)... @%p -> %p\n",
-					 symbol_name, seg_index, seg_offset, vmaddr, func_ptr);
+					*vmaddr = (uint64_t) func_ptr;
 
-				// advance the address, this is done so binding for the immidiate next pointer
-				// in __DATA does not require another SET_SEGMENT_AND_OFFSET_ULEB
-				// usually used for non-lazy binding
-				vmaddr++;
+					LOGF("Lazy Binding %s (seg: %lu, offset: 0x%lx)... @%p -> %p\n",
+						 symbol_name, seg_index, seg_offset, vmaddr, func_ptr);
+
+					// advance the address, this is done so binding for the immidiate next pointer
+					// in __DATA does not require another SET_SEGMENT_AND_OFFSET_ULEB
+					// usually used for non-lazy binding
+					vmaddr++;
+
+					free(bsd_symbol_name);
+				}
 				break;
 
 			default:
