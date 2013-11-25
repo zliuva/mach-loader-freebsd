@@ -1,4 +1,6 @@
 loader
 *.o
 test/*
+osx-bin
+osx-usr-bin
 

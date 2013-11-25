@@ -14,6 +14,8 @@
 
 #include <mach-o/loader.h>
 
+#include "osx_compat.h"
+
 #ifdef NDEBUG
 	#define LOGF(...)
 #else
@@ -36,10 +38,6 @@ struct dyld_info_command *dyld_info;
 
 extern void boot(uint64_t argc, char **argv, char **envp, char **envp_end, uint64_t entry, uint64_t is_lc_main);
 extern void dyld_stub_binder(void);
-
-bool compat_mode(void) {
-	return true;
-}
 
 static uint64_t read_uleb128(const uint8_t** p, const uint8_t* end) {
 	uint64_t result = 0;
@@ -142,15 +140,13 @@ int load_segment(struct load_command *command) {
 	return 0;
 }
 
-uint64_t dyld_stub_binder_impl(void** image_loader_cache, uint64_t lazy_offset) {
+uint64_t do_bind(const uint8_t * const start, const uint8_t * const end, bool lazy) {
 	uint64_t seg_index = -1;
 	uint64_t seg_offset = -1;
 	uint64_t *vmaddr = NULL;
 	void *func_ptr = NULL;
 	char *symbol_name;
 
-	const uint8_t * const start = (uint8_t *) header + dyld_info->lazy_bind_off + lazy_offset;
-	const uint8_t * const end = start + dyld_info->lazy_bind_size;
 	const uint8_t *p = start;
 
 	bool done = false;
@@ -162,7 +158,7 @@ uint64_t dyld_stub_binder_impl(void** image_loader_cache, uint64_t lazy_offset) 
 
 		switch (opcode) {
 			case BIND_OPCODE_DONE:
-				done = true;
+				done = lazy;
 				break;
 
 			case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
@@ -182,34 +178,47 @@ uint64_t dyld_stub_binder_impl(void** image_loader_cache, uint64_t lazy_offset) 
 
 			case BIND_OPCODE_DO_BIND:
 				{
-					char *bsd_symbol_name = strdup(symbol_name + 1); // +1 to remove the "_"
-					char *inode_64 = strstr(bsd_symbol_name, "$INODE64");
-					if (inode_64) {
-						*inode_64 = '\0';
-					}
+					func_ptr = dlsym(RTLD_DEFAULT, symbol_name + 1); // +1 to remove the "_"
 
-					func_ptr = dlsym(RTLD_DEFAULT, bsd_symbol_name); // +1 to remove the "_"
+					if (!func_ptr) {
+#define IMPL(osx_symbol, impl) \
+if (strcmp(#osx_symbol, symbol_name) == 0) { \
+	func_ptr = impl; \
+}
 
 #define REPLACE(osx_symbol, bsd_symbol) \
 if (strcmp(#osx_symbol, symbol_name) == 0) { \
-	func_ptr = bsd_symbol; \
+	func_ptr = dlsym(RTLD_DEFAULT, #bsd_symbol); \
 }
 
-					REPLACE(_compat_mode, compat_mode);
-					REPLACE(___strlcpy_chk, strlcpy);
-					REPLACE(___snprintf_chk, snprintf);
+						IMPL(dyld_stub_binder, dyld_stub_binder);
+						IMPL(_compat_mode, compat_mode);
+
+						REPLACE(___strlcpy_chk, strlcpy);
+						REPLACE(___snprintf_chk, snprintf);
+						REPLACE(_fstat$INODE64, fstat);
+						REPLACE(_stat$INODE64, stat);
+						REPLACE(_lstat$INODE64, lstat);
+						REPLACE(_fts_open$INODE64, fts_open);
+						REPLACE(_fts_read$INODE64, fts_read);
+						REPLACE(_fts_close$INODE64, fts_close);
+
+						if (!func_ptr) {
+							LOGF("Symbol %s not found.\n", symbol_name);
+							assert(NULL);
+						}
+					}
 
 					*vmaddr = (uint64_t) func_ptr;
 
-					LOGF("Lazy Binding %s (seg: %lu, offset: 0x%lx)... @%p -> %p\n",
+					LOGF("%sBinding %s (seg: %lu, offset: 0x%lx)... @%p -> %p\n",
+						 lazy ? "Lazy " : "",
 						 symbol_name, seg_index, seg_offset, vmaddr, func_ptr);
 
 					// advance the address, this is done so binding for the immidiate next pointer
 					// in __DATA does not require another SET_SEGMENT_AND_OFFSET_ULEB
 					// usually used for non-lazy binding
 					vmaddr++;
-
-					free(bsd_symbol_name);
 				}
 				break;
 
@@ -221,10 +230,18 @@ if (strcmp(#osx_symbol, symbol_name) == 0) { \
 	return (uint64_t) func_ptr;
 }
 
+uint64_t dyld_stub_binder_impl(void** image_loader_cache, uint64_t lazy_offset) {
+	const uint8_t * const start = (uint8_t *) header + dyld_info->lazy_bind_off + lazy_offset;
+	const uint8_t * const end = start + dyld_info->lazy_bind_size;
+
+	return do_bind(start, end, true);
+}
+
 int main(int argc, char **argv, char **envp) {
 	const char *fname = argv[1];
 
 	fd_image = open(fname, O_RDONLY);
+	assert(fd_image >= 0);
 
 	struct stat sb;
 	fstat(fd_image, &sb);
@@ -280,59 +297,10 @@ int main(int argc, char **argv, char **envp) {
 				{
 					dyld_info = (struct dyld_info_command *) command;
 
-					uint64_t seg_index = -1;
-					uint64_t seg_offset = -1;
-					uint64_t *vmaddr = NULL;
-					void *func_ptr = NULL;
-					char *symbol_name;
+					const uint8_t * const start = (uint8_t *) header + dyld_info->bind_off;
+					const uint8_t * const end = start + dyld_info->bind_size;
 
-					const uint8_t *start = (uint8_t *) header + dyld_info->bind_off;
-					const uint8_t *end = start + dyld_info->bind_size;
-					const uint8_t *p = start;
-
-					while (p < end) {
-						uint8_t immediate = *p & BIND_IMMEDIATE_MASK;
-						uint8_t opcode = *p & BIND_OPCODE_MASK;
-						p++;
-
-						switch (opcode) {
-							case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
-								seg_index = immediate;
-								seg_offset = read_uleb128(&p, end);
-								vmaddr = (uint64_t *) (segments[seg_index]->vmaddr + seg_offset);
-								break;
-
-							case BIND_OPCODE_ADD_ADDR_ULEB:
-								vmaddr = (uint64_t *) ((uint64_t) vmaddr + read_uleb128(&p, end));
-								break;
-
-							case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
-								symbol_name = (char *) p;
-								while (*p++);
-								break;
-
-							case BIND_OPCODE_DO_BIND:
-								if (strncmp("dyld_stub_binder", symbol_name, 16) == 0) {
-									func_ptr = dyld_stub_binder;
-								} else {
-									func_ptr = dlsym(RTLD_DEFAULT, symbol_name + 1); // +1 to remove the "_"
-								}
-
-								*vmaddr = (uint64_t) func_ptr;
-
-								LOGF("Binding %s (seg: %lu, offset: 0x%lx)... @%p -> %p\n",
-									 symbol_name, seg_index, seg_offset, vmaddr, func_ptr);
-
-								// advance the address, this is done so binding for the immidiate next pointer
-								// in __DATA does not require another SET_SEGMENT_AND_OFFSET_ULEB
-								// usually used for non-lazy binding
-								vmaddr++;
-								break;
-
-							default:
-								break;
-						}
-					}
+					do_bind(start, end, false);
 				}
 				break;
 
@@ -364,6 +332,7 @@ int main(int argc, char **argv, char **envp) {
 	char **envp_end = envp;
 	while (*envp_end) envp_end++;
 
+	LOGF("jumping to entry point: 0x%lx\n", entry_point);
 	boot(argc - 1, argv + 1, envp, envp_end, entry_point, is_lc_main);
 }
 
