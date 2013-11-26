@@ -28,13 +28,13 @@
 
 static int fd_image = -1;
 
-struct mach_header_64 *header;
+static struct mach_header_64 *header;
 
-struct segment_command_64 *segments[MAX_SEGMENTS];
-struct segment_command_64 *text_seg = NULL;
+static struct segment_command_64 *segments[MAX_SEGMENTS];
+static struct segment_command_64 *text_seg = NULL;
 static int current_seg = -1;
 
-struct dyld_info_command *dyld_info;
+static struct dyld_info_command *dyld_info;
 
 extern void boot(uint64_t argc, char **argv, char **envp, char **envp_end, uint64_t entry, uint64_t is_lc_main);
 extern void dyld_stub_binder(void);
@@ -182,14 +182,14 @@ uint64_t do_bind(const uint8_t * const start, const uint8_t * const end, bool la
 
 					if (!func_ptr) {
 #define IMPL(osx_symbol, impl) \
-if (strcmp(#osx_symbol, symbol_name) == 0) { \
-	func_ptr = impl; \
-}
+						if (strcmp(#osx_symbol, symbol_name) == 0) { \
+							func_ptr = impl; \
+						}
 
 #define REPLACE(osx_symbol, bsd_symbol) \
-if (strcmp(#osx_symbol, symbol_name) == 0) { \
-	func_ptr = dlsym(RTLD_DEFAULT, #bsd_symbol); \
-}
+						if (strcmp(#osx_symbol, symbol_name) == 0) { \
+							func_ptr = dlsym(RTLD_DEFAULT, #bsd_symbol); \
+						}
 
 						IMPL(dyld_stub_binder, dyld_stub_binder);
 						IMPL(_compat_mode, compat_mode);
