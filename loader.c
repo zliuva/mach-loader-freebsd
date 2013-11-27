@@ -22,19 +22,34 @@
 	#define LOGF(...) fprintf(stderr, __VA_ARGS__)
 #endif
 
-#define MAX_SEGMENTS 255
+#define MAX_SEGMENTS	255
+#define MAX_IMAGES		400
 
 #define PAGE_SIZE getpagesize()
 
-static int fd_image = -1;
+struct mach_image {
+	const char *path;									// path of the image
+	int fd;												// fd of the opened image
 
-static struct mach_header_64 *header;
+	struct mach_header_64 *header;						// reference to Mach-O header
 
-static struct segment_command_64 *segments[MAX_SEGMENTS];
-static struct segment_command_64 *text_seg = NULL;
-static int current_seg = -1;
+	struct segment_command_64 *segments[MAX_SEGMENTS];	// reference to segments
+	struct segment_command_64 *text_seg;				// reference to __TEXT
+	int num_segments;
 
-static struct dyld_info_command *dyld_info;
+	struct dyld_info_command *dyld_info;				// reference to LC_DYLD_INFO_ONLY
+
+	uint64_t entry_point;								// entry point
+	bool is_lc_main;
+};
+
+struct {
+	struct mach_image *image;
+	uint64_t start;
+	uint64_t end;
+} mapped_ranges[MAX_IMAGES];
+
+static int num_mapped_ranges = 0;
 
 extern void boot(uint64_t argc, char **argv, char **envp, char **envp_end, uint64_t entry, uint64_t is_lc_main);
 extern void dyld_stub_binder(void);
@@ -56,13 +71,30 @@ static uint64_t read_uleb128(const uint8_t** p, const uint8_t* end) {
 		}
 	} while (*(*p)++ & 0x80);
 	return result;
-} 
+}
 
-int load_segment(struct load_command *command) {
-	struct segment_command_64 *seg_command = (struct segment_command_64 *) command;
+static void add_mapped_range(struct mach_image *image, uint64_t start, uint64_t end) {
+	mapped_ranges[num_mapped_ranges].image = image;
+	mapped_ranges[num_mapped_ranges].start = start;
+	mapped_ranges[num_mapped_ranges].end = end;
+
+	num_mapped_ranges++;
+}
+
+static struct mach_image *find_image(uint64_t target) {
+	for (int i = 0; i < num_mapped_ranges; i++) {
+		if (target >= mapped_ranges[i].start && target < mapped_ranges[i].end) {
+			return mapped_ranges[i].image;
+		}
+	}
+
+	return NULL;
+}
+
+int load_segment(struct mach_image *image, struct segment_command_64 *seg_command) {
 	LOGF("Loading segment %s: ", seg_command->segname);
 
-	segments[++current_seg] = seg_command;
+	image->segments[image->num_segments++] = seg_command;
 
 	if (strcmp(seg_command->segname, SEG_PAGEZERO) == 0) {
 		LOGF("ignored.\n");
@@ -70,7 +102,7 @@ int load_segment(struct load_command *command) {
 	}
 
 	if (strcmp(seg_command->segname, SEG_TEXT) == 0) {
-		text_seg = seg_command;
+		image->text_seg = seg_command;
 	}
 
 	LOGF("Mapping 0x%lx(0x%lx) to 0x%lx(0x%lx): ",
@@ -97,7 +129,7 @@ int load_segment(struct load_command *command) {
 	void *segment = mmap((void *) seg_command->vmaddr, aligned_size,
 						 seg_command->initprot,
 						 MAP_PRIVATE | MAP_FIXED,
-						 fd_image, seg_command->fileoff);
+						 image->fd, seg_command->fileoff);
 	if (segment == MAP_FAILED) {
 		perror("mmap");
 		return -1;
@@ -140,7 +172,7 @@ int load_segment(struct load_command *command) {
 	return 0;
 }
 
-uint64_t do_bind(const uint8_t * const start, const uint8_t * const end, bool lazy) {
+uint64_t do_bind(struct mach_image *image, const uint8_t * const start, const uint8_t * const end, bool lazy) {
 	uint64_t seg_index = -1;
 	uint64_t seg_offset = -1;
 	uint64_t *vmaddr = NULL;
@@ -164,7 +196,7 @@ uint64_t do_bind(const uint8_t * const start, const uint8_t * const end, bool la
 			case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
 				seg_index = immediate;
 				seg_offset = read_uleb128(&p, end);
-				vmaddr = (uint64_t *) (segments[seg_index]->vmaddr + seg_offset);
+				vmaddr = (uint64_t *) (image->segments[seg_index]->vmaddr + seg_offset);
 				break;
 
 			case BIND_OPCODE_ADD_ADDR_ULEB:
@@ -230,40 +262,46 @@ uint64_t do_bind(const uint8_t * const start, const uint8_t * const end, bool la
 	return (uint64_t) func_ptr;
 }
 
-uint64_t dyld_stub_binder_impl(void** image_loader_cache, uint64_t lazy_offset) {
-	const uint8_t * const start = (uint8_t *) header + dyld_info->lazy_bind_off + lazy_offset;
-	const uint8_t * const end = start + dyld_info->lazy_bind_size;
+uint64_t dyld_stub_binder_impl(struct mach_image **image_cache, uint64_t lazy_offset) {
+	struct mach_image *image = *image_cache;
 
-	return do_bind(start, end, true);
+	if (!image) {
+		image = find_image((uint64_t) image_cache);
+		*image_cache = image;
+
+		assert(image);
+	}
+
+	const uint8_t * const start = (uint8_t *) image->header + image->dyld_info->lazy_bind_off + lazy_offset;
+	const uint8_t * const end = start + image->dyld_info->lazy_bind_size;
+
+	return do_bind(image, start, end, true);
 }
 
-int main(int argc, char **argv, char **envp) {
-	const char *fname = argv[1];
+void load_mach_image(struct mach_image *image) {
+	image->is_lc_main = false;
+	image->num_segments = 0;
 
-	fd_image = open(fname, O_RDONLY);
-	assert(fd_image >= 0);
+	image->fd = open(image->path, O_RDONLY);
+	assert(image->fd >= 0);
 
 	struct stat sb;
-	fstat(fd_image, &sb);
+	fstat(image->fd, &sb);
 
-	header = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd_image, 0);
+	image->header = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, image->fd, 0);
 
-	assert(header->magic == MH_MAGIC_64);
-	assert(header->cputype == CPU_TYPE_X86_64);
-	assert(header->filetype == MH_EXECUTE);
+	assert(image->header->magic == MH_MAGIC_64);
+	assert(image->header->cputype == CPU_TYPE_X86_64);
+	assert(image->header->filetype == MH_EXECUTE);
 
-	struct x86_thread_state *thread_state;
-	uint64_t entry_point;
-	bool is_lc_main = false;
-
-	struct load_command *command = (struct load_command *) (header + 1);
+	struct load_command *command = (struct load_command *) (image->header + 1);
 
 #define IGNORE_COMMAND(command) \
 		case command: \
 			LOGF("Load command %d ignored: %s\n", i, #command); \
 			break
 
-	for (int i = 0; i < header->ncmds; i++) {
+	for (int i = 0; i < image->header->ncmds; i++) {
 		switch (command->cmd) {
 			IGNORE_COMMAND(LC_UUID);
 			IGNORE_COMMAND(LC_SEGMENT);
@@ -290,33 +328,36 @@ int main(int argc, char **argv, char **envp) {
 			IGNORE_COMMAND(LC_CODE_SIGNATURE);
 
 			case LC_SEGMENT_64:
-				load_segment(command);
+				load_segment(image, (struct segment_command_64 *) command);
 				break;
 
 			case LC_DYLD_INFO_ONLY:
 				{
-					dyld_info = (struct dyld_info_command *) command;
+					image->dyld_info = (struct dyld_info_command *) command;
 
-					const uint8_t * const start = (uint8_t *) header + dyld_info->bind_off;
-					const uint8_t * const end = start + dyld_info->bind_size;
+					const uint8_t * const start = (uint8_t *) image->header + image->dyld_info->bind_off;
+					const uint8_t * const end = start + image->dyld_info->bind_size;
 
-					do_bind(start, end, false);
+					do_bind(image, start, end, false);
 				}
 				break;
 
 			case LC_UNIXTHREAD:
-				LOGF("Processing LC_UNIXTHREAD... ");
-				thread_state = (struct x86_thread_state *) (command + 1);
-				assert(thread_state->tsh.flavor == x86_THREAD_STATE64);
-				entry_point = thread_state->uts.ts64.rip;
-				LOGF("Entry Point: 0x%lx\n", entry_point);
+				{
+					struct x86_thread_state *thread_state;
+					LOGF("Processing LC_UNIXTHREAD... ");
+					thread_state = (struct x86_thread_state *) (command + 1);
+					assert(thread_state->tsh.flavor == x86_THREAD_STATE64);
+					image->entry_point = thread_state->uts.ts64.rip;
+					LOGF("Entry Point: 0x%lx\n", image->entry_point);
+				}
 				break;
 
 			case LC_MAIN:
 				LOGF("Processing LC_MAIN... ");
-				entry_point = text_seg->vmaddr + ((struct entry_point_command *) command)->entryoff;
-				is_lc_main = true;
-				LOGF("Entry Point: 0x%lx\n", entry_point);
+				image->entry_point = image->text_seg->vmaddr + ((struct entry_point_command *) command)->entryoff;
+				image->is_lc_main = true;
+				LOGF("Entry Point: 0x%lx\n", image->entry_point);
 				break;
 
 			default:
@@ -326,13 +367,46 @@ int main(int argc, char **argv, char **envp) {
 
 		command = (struct load_command *) ((char *) command + command->cmdsize);
 	}
-	
-	close(fd_image);
 
+	// maintain a mapping between vm ranges and mach_images (implemented like Apple's dyld)
+	uint64_t last_seg_start = 0, last_seg_end = 0;
+	for (int i = 0; i < image->num_segments; i++) {
+		if (!image->segments[i]->initprot) { // unaccessable, probably __PAGEZERO
+			continue;
+		}
+
+		uint64_t seg_start = image->segments[i]->vmaddr;
+		uint64_t seg_end = seg_start + image->segments[i]->vmsize;
+
+		if (seg_start == last_seg_end) { // contiguous segments, keep counting
+			last_seg_end = seg_end;
+		} else {
+			if (last_seg_end) {
+				add_mapped_range(image, last_seg_start, last_seg_end);
+			}
+			
+			last_seg_start = seg_start;
+			last_seg_end = seg_end;
+		}
+	}
+	
+	if (last_seg_end) {
+		add_mapped_range(image, last_seg_start, last_seg_end);
+	}
+
+	close(image->fd);
+}
+
+int main(int argc, char **argv, char **envp) {
+	struct mach_image main_image;
+	main_image.path = argv[1];
+
+	load_mach_image(&main_image);
+	
 	char **envp_end = envp;
 	while (*envp_end) envp_end++;
 
-	LOGF("jumping to entry point: 0x%lx\n", entry_point);
-	boot(argc - 1, argv + 1, envp, envp_end, entry_point, is_lc_main);
-}
+	LOGF("jumping to entry point: 0x%lx\n", main_image.entry_point);
+	boot(argc - 1, argv + 1, envp, envp_end, main_image.entry_point, main_image.is_lc_main);
 
+}
