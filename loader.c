@@ -41,12 +41,13 @@ struct mach_image {
 	struct segment_command_64 *text_seg;				// reference to __TEXT
 	int num_segments;									// number of segments
 
+	uint64_t link_edit_base;							// offset of LINKEDIT after loading
 	uint64_t slide;										// slide (if rebased)
 
 	struct dyld_info_command *dyld_info;				// reference to LC_DYLD_INFO_ONLY
 
 	uint64_t entry_point;								// entry point
-	bool is_lc_main;
+	bool is_lc_main;									// LC_MAIN?
 };
 
 static struct mach_image *loaded_images[MAX_IMAGES];
@@ -175,6 +176,10 @@ int load_segment(struct mach_image *image, struct segment_command_64 *seg_comman
 
 	highest_addr = load_addr + seg_command->vmsize;
 
+	if (strcmp(seg_command->segname, SEG_LINKEDIT) == 0) {
+		image->link_edit_base = load_addr - seg_command->fileoff;
+	}
+
 	// patch syscall
 	if (strcmp(seg_command->segname, SEG_TEXT) == 0) {
 		mprotect(segment, seg_command->vmsize, seg_command->initprot | PROT_WRITE);
@@ -260,7 +265,7 @@ const uint8_t *trie_walk(const uint8_t *start, const uint8_t *end, const char *s
 }
 
 uint64_t find_exported_symbol_in_image(struct mach_image *image, const char *name) {
-	const uint8_t *start = (uint8_t *) image->header + image->dyld_info->export_off;
+	const uint8_t *start = (uint8_t *) image->link_edit_base + image->dyld_info->export_off;
 	const uint8_t *end = start + image->dyld_info->export_size;
 	const uint8_t *node_start = trie_walk(start, end, name);
 
@@ -392,7 +397,7 @@ uint64_t dyld_stub_binder_impl(struct mach_image **image_cache, uint64_t lazy_of
 		assert(image);
 	}
 
-	const uint8_t * const start = (uint8_t *) image->header + image->dyld_info->lazy_bind_off + lazy_offset;
+	const uint8_t * const start = (uint8_t *) image->link_edit_base + image->dyld_info->lazy_bind_off + lazy_offset;
 	const uint8_t * const end = start + image->dyld_info->lazy_bind_size;
 
 	return do_bind(image, start, end, true);
@@ -493,7 +498,7 @@ void load_mach_image(struct mach_image *image) {
 				{
 					image->dyld_info = (struct dyld_info_command *) command;
 
-					const uint8_t * const start = (uint8_t *) image->header + image->dyld_info->bind_off;
+					const uint8_t * const start = (uint8_t *) image->link_edit_base + image->dyld_info->bind_off;
 					const uint8_t * const end = start + image->dyld_info->bind_size;
 
 					do_bind(image, start, end, false);
@@ -527,6 +532,9 @@ void load_mach_image(struct mach_image *image) {
 	}
 
 	close(image->fd);
+
+	// keep the first page for reference of header and loading commands
+	munmap((uint8_t *) image->header + PAGE_SIZE, sb.st_size - PAGE_SIZE);
 
 	// maintain a mapping between vm ranges and mach_images (implemented like Apple's dyld)
 	uint64_t last_seg_start = 0, last_seg_end = 0;
