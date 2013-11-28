@@ -1,6 +1,6 @@
 CC = clang
 AS = as
-CPPFLAGS = -I./include
+CPPFLAGS = -I./include -DUSE_BSD_LIBS
 CFLAGS = -std=c99
 LDFLAGS = -lm
 

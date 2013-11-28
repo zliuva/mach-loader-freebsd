@@ -7,7 +7,7 @@ LD = ld
 C_BINS = hello getpid args return_val
 ASM_BINS = hello_asm
 
-all: $(C_BINS) $(ASM_BINS)
+all: $(C_BINS) $(ASM_BINS) test_dylib
 
 $(C_BINS):
 	$(CC) $(CFLAGS) -o $@ $<
@@ -17,6 +17,12 @@ $(ASM_BINS):
 
 %.o: %.S
 	$(AS) -o $@ $<
+
+test_dylib: test_dylib.c libmy.dylib
+	$(CC) $(CFLAGS) -lmy -L. -o $@ $<
+
+libmy.dylib: mylib.c
+	$(CC) -install_name "@executable_path/$@" -o $@ -dynamiclib mylib.c
 
 clean:
 	rm -f $(C_BINS) $(ASM_BINS) *.o

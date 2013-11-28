@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <string.h>
 #include <assert.h>
+#include <limits.h>
+#include <libgen.h>
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -22,6 +24,8 @@
 	#define LOGF(...) fprintf(stderr, __VA_ARGS__)
 #endif
 
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
 #define MAX_SEGMENTS	255
 #define MAX_IMAGES		400
 
@@ -35,7 +39,9 @@ struct mach_image {
 
 	struct segment_command_64 *segments[MAX_SEGMENTS];	// reference to segments
 	struct segment_command_64 *text_seg;				// reference to __TEXT
-	int num_segments;
+	int num_segments;									// number of segments
+
+	uint64_t slide;										// slide (if rebased)
 
 	struct dyld_info_command *dyld_info;				// reference to LC_DYLD_INFO_ONLY
 
@@ -43,13 +49,19 @@ struct mach_image {
 	bool is_lc_main;
 };
 
-struct {
+static struct mach_image *loaded_images[MAX_IMAGES];
+
+static int num_loaded_images = 0;
+
+static struct {
 	struct mach_image *image;
 	uint64_t start;
 	uint64_t end;
-} mapped_ranges[MAX_IMAGES];
+} mapped_ranges[MAX_IMAGES * MAX_SEGMENTS];
 
 static int num_mapped_ranges = 0;
+
+static uint64_t highest_addr = 0; // the highest address mapped so far
 
 extern void boot(uint64_t argc, char **argv, char **envp, char **envp_end, uint64_t entry, uint64_t is_lc_main);
 extern void dyld_stub_binder(void);
@@ -97,6 +109,7 @@ int load_segment(struct mach_image *image, struct segment_command_64 *seg_comman
 	image->segments[image->num_segments++] = seg_command;
 
 	if (strcmp(seg_command->segname, SEG_PAGEZERO) == 0) {
+		assert(image->header->filetype == MH_EXECUTE); // dylib shouldn't have PAGEZERO
 		LOGF("ignored.\n");
 		return 0;
 	}
@@ -104,10 +117,23 @@ int load_segment(struct mach_image *image, struct segment_command_64 *seg_comman
 	if (strcmp(seg_command->segname, SEG_TEXT) == 0) {
 		image->text_seg = seg_command;
 	}
+	
+	uint64_t load_addr = MAX(highest_addr, seg_command->vmaddr);
 
-	LOGF("Mapping 0x%lx(0x%lx) to 0x%lx(0x%lx): ",
+	LOGF("Mapping 0x%lx(0x%lx) to 0x%lx(0x%lx)",
 			seg_command->fileoff, seg_command->filesize,
 			seg_command->vmaddr, seg_command->vmsize);
+
+	if (load_addr > seg_command->vmaddr) {
+		LOGF(", rebase to 0x%lx", load_addr);
+
+		if (image->slide) {
+			assert(image->slide == load_addr - seg_command->vmaddr);
+		}
+
+		image->slide = load_addr - seg_command->vmaddr;
+	}
+	LOGF(": ");
 
 	assert(VM_PROT_READ == PROT_READ);
 	assert(VM_PROT_WRITE == PROT_WRITE);
@@ -125,8 +151,8 @@ int load_segment(struct mach_image *image, struct segment_command_64 *seg_comman
 	LOGF("\n");
 
 	// it seems on FreeBSD mmap aligns to page boundaries
-	uint64_t aligned_size = (seg_command->filesize + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
-	void *segment = mmap((void *) seg_command->vmaddr, aligned_size,
+	uint64_t aligned_size = (seg_command->filesize + PAGE_SIZE - 1) & -PAGE_SIZE;
+	void *segment = mmap((void *) load_addr, aligned_size,
 						 seg_command->initprot,
 						 MAP_PRIVATE | MAP_FIXED,
 						 image->fd, seg_command->fileoff);
@@ -135,17 +161,19 @@ int load_segment(struct mach_image *image, struct segment_command_64 *seg_comman
 		return -1;
 	}
 
-	assert(segment == (void *) seg_command->vmaddr);
+	assert(segment == (void *) load_addr);
 
 	// if there's any left over, map it ourselves (it seems mmap zero-fills it too);
 	if (seg_command->vmsize > aligned_size) {
 		int n_zeros = seg_command->vmsize - aligned_size;
-		void *zeros = mmap((void *) (seg_command->vmaddr + aligned_size), n_zeros,
+		void *zeros = mmap((void *) (load_addr + aligned_size), n_zeros,
 						   seg_command->initprot,
 						   MAP_ANON | MAP_PRIVATE | MAP_FIXED,
 						   -1, 0);
-		assert(zeros == (void *) (seg_command->vmaddr + aligned_size));
+		assert(zeros == (void *) (load_addr + aligned_size));
 	}
+
+	highest_addr = load_addr + seg_command->vmsize;
 
 	// patch syscall
 	if (strcmp(seg_command->segname, SEG_TEXT) == 0) {
@@ -172,6 +200,89 @@ int load_segment(struct mach_image *image, struct segment_command_64 *seg_comman
 	return 0;
 }
 
+/**
+ * adapted from Apple's dyld (Apple Public Source License)
+ */
+const uint8_t *trie_walk(const uint8_t *start, const uint8_t *end, const char *s) {
+	const uint8_t* p = start;
+	while (p) {
+		uint32_t terminal_size = *p++;
+		if ( terminal_size > 127 ) {
+			--p;
+			terminal_size = read_uleb128(&p, end);
+		}
+		if ( (*s == '\0') && (terminal_size != 0) ) {
+			return p;
+		}
+		const uint8_t* children = p + terminal_size;
+		uint8_t children_remaining = *children++;
+		p = children;
+		uint32_t node_offset = 0;
+		for (; children_remaining > 0; --children_remaining) {
+			const char* ss = s;
+			bool wrong_edge = false;
+			// scan whole edge to get to next edge
+			// if edge is longer than target symbol name, don't read past end of symbol name
+			char c = *p;
+			while ( c != '\0' ) {
+				if ( !wrong_edge ) {
+					if ( c != *ss )
+						wrong_edge = true;
+					++ss;
+				}
+				++p;
+				c = *p;
+			}
+			if ( wrong_edge ) {
+				// advance to next child
+				++p; // skip over zero terminator
+				// skip over uleb128 until last byte is found
+				while ( (*p & 0x80) != 0 )
+					++p;
+				++p; // skil over last byte of uleb128
+			}
+			else {
+ 				// the symbol so far matches this edge (child)
+				// so advance to the child's node
+				++p;
+				node_offset = read_uleb128(&p, end);
+				s = ss;
+				break;
+			}
+		}
+		if ( node_offset != 0 )
+			p = &start[node_offset];
+		else
+			p = NULL;
+	}
+
+	return NULL;
+}
+
+uint64_t find_exported_symbol_in_image(struct mach_image *image, const char *name) {
+	const uint8_t *start = (uint8_t *) image->header + image->dyld_info->export_off;
+	const uint8_t *end = start + image->dyld_info->export_size;
+	const uint8_t *node_start = trie_walk(start, end, name);
+
+	if (node_start) {
+		uint32_t flags = read_uleb128(&node_start, end);
+		assert((flags & EXPORT_SYMBOL_FLAGS_KIND_MASK) == EXPORT_SYMBOL_FLAGS_KIND_REGULAR);
+		return image->slide + read_uleb128(&node_start, end);
+	}
+
+	return 0x0;
+}
+
+uint64_t find_exported_symbol(const char *name) {
+	uint64_t found_addr = 0x0;
+	
+	for (int i = 1; i < num_loaded_images && !found_addr; i++) { // 0 is the main executable, starts from 1
+		found_addr = find_exported_symbol_in_image(loaded_images[i], name);
+	}
+
+	return found_addr;
+}
+
 uint64_t do_bind(struct mach_image *image, const uint8_t * const start, const uint8_t * const end, bool lazy) {
 	uint64_t seg_index = -1;
 	uint64_t seg_offset = -1;
@@ -196,7 +307,7 @@ uint64_t do_bind(struct mach_image *image, const uint8_t * const start, const ui
 			case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
 				seg_index = immediate;
 				seg_offset = read_uleb128(&p, end);
-				vmaddr = (uint64_t *) (image->segments[seg_index]->vmaddr + seg_offset);
+				vmaddr = (uint64_t *) (image->slide + image->segments[seg_index]->vmaddr + seg_offset);
 				break;
 
 			case BIND_OPCODE_ADD_ADDR_ULEB:
@@ -210,20 +321,21 @@ uint64_t do_bind(struct mach_image *image, const uint8_t * const start, const ui
 
 			case BIND_OPCODE_DO_BIND:
 				{
+#define IMPL(osx_symbol, impl) \
+					if (strcmp(#osx_symbol, symbol_name) == 0) { \
+						func_ptr = impl; \
+					}
+
+
+#ifdef USE_BSD_LIBS
 					func_ptr = dlsym(RTLD_DEFAULT, symbol_name + 1); // +1 to remove the "_"
 
 					if (!func_ptr) {
-#define IMPL(osx_symbol, impl) \
-						if (strcmp(#osx_symbol, symbol_name) == 0) { \
-							func_ptr = impl; \
-						}
-
 #define REPLACE(osx_symbol, bsd_symbol) \
 						if (strcmp(#osx_symbol, symbol_name) == 0) { \
 							func_ptr = dlsym(RTLD_DEFAULT, #bsd_symbol); \
 						}
 
-						IMPL(dyld_stub_binder, dyld_stub_binder);
 						IMPL(_compat_mode, compat_mode);
 
 						REPLACE(___strlcpy_chk, strlcpy);
@@ -235,10 +347,18 @@ uint64_t do_bind(struct mach_image *image, const uint8_t * const start, const ui
 						REPLACE(_fts_read$INODE64, fts_read);
 						REPLACE(_fts_close$INODE64, fts_close);
 
-						if (!func_ptr) {
-							LOGF("Symbol %s not found.\n", symbol_name);
-							assert(NULL);
-						}
+					}
+#endif
+
+					IMPL(dyld_stub_binder, dyld_stub_binder);
+
+					if (!func_ptr) {
+						func_ptr = (void *) find_exported_symbol(symbol_name);
+					}
+
+					if (!func_ptr) {
+						LOGF("Symbol %s not found.\n", symbol_name);
+						assert(NULL);
 					}
 
 					*vmaddr = (uint64_t) func_ptr;
@@ -279,8 +399,11 @@ uint64_t dyld_stub_binder_impl(struct mach_image **image_cache, uint64_t lazy_of
 }
 
 void load_mach_image(struct mach_image *image) {
+	loaded_images[num_loaded_images++] = image;
+
 	image->is_lc_main = false;
 	image->num_segments = 0;
+	image->slide = 0;
 
 	image->fd = open(image->path, O_RDONLY);
 	assert(image->fd >= 0);
@@ -292,7 +415,7 @@ void load_mach_image(struct mach_image *image) {
 
 	assert(image->header->magic == MH_MAGIC_64);
 	assert(image->header->cputype == CPU_TYPE_X86_64);
-	assert(image->header->filetype == MH_EXECUTE);
+	assert(image->header->filetype == MH_EXECUTE || image->header->filetype == MH_DYLIB);
 
 	struct load_command *command = (struct load_command *) (image->header + 1);
 
@@ -308,7 +431,6 @@ void load_mach_image(struct mach_image *image) {
 			IGNORE_COMMAND(LC_SYMTAB);
 			IGNORE_COMMAND(LC_DYSYMTAB);
 			IGNORE_COMMAND(LC_THREAD);
-			IGNORE_COMMAND(LC_LOAD_DYLIB);
 			IGNORE_COMMAND(LC_ID_DYLIB);
 			IGNORE_COMMAND(LC_PREBOUND_DYLIB);
 			IGNORE_COMMAND(LC_LOAD_DYLINKER);
@@ -329,6 +451,42 @@ void load_mach_image(struct mach_image *image) {
 
 			case LC_SEGMENT_64:
 				load_segment(image, (struct segment_command_64 *) command);
+				break;
+
+			case LC_LOAD_DYLIB:
+				{
+					struct dylib dylib = ((struct dylib_command *) command)->dylib;
+					const char *path = (const char *) ((uint8_t *) command + dylib.name.offset);
+
+#ifdef USE_BSD_LIBS
+					// since we're using BSD libs, do not load anything starting with a '/'
+					if (path[0] == '/') {
+						LOGF("Skipping dylib: %s\n", path);
+						break;
+					}
+#endif
+
+					char buf[PATH_MAX];
+					if (strncmp(path, "@executable_path", 16) == 0) {
+						realpath(loaded_images[0]->path, buf);
+					} else if (strncmp(path, "@loader_path", 12) == 0) {
+						realpath(image->path, buf);
+					}
+
+					char resolved_path[PATH_MAX];
+					sprintf(resolved_path, "%s/%s", dirname(buf), basename(path));
+					
+
+					LOGF("Loading dylib: %s\n", resolved_path);
+
+					// we'll never have a chance to free it
+					struct mach_image *dylib_image = (struct mach_image *) malloc(sizeof(struct mach_image));
+					dylib_image->path = resolved_path;
+
+					load_mach_image(dylib_image);
+
+					LOGF("%s loaded.\n", resolved_path);
+				}
 				break;
 
 			case LC_DYLD_INFO_ONLY:
@@ -368,6 +526,8 @@ void load_mach_image(struct mach_image *image) {
 		command = (struct load_command *) ((char *) command + command->cmdsize);
 	}
 
+	close(image->fd);
+
 	// maintain a mapping between vm ranges and mach_images (implemented like Apple's dyld)
 	uint64_t last_seg_start = 0, last_seg_end = 0;
 	for (int i = 0; i < image->num_segments; i++) {
@@ -393,8 +553,6 @@ void load_mach_image(struct mach_image *image) {
 	if (last_seg_end) {
 		add_mapped_range(image, last_seg_start, last_seg_end);
 	}
-
-	close(image->fd);
 }
 
 int main(int argc, char **argv, char **envp) {
@@ -408,5 +566,5 @@ int main(int argc, char **argv, char **envp) {
 
 	LOGF("jumping to entry point: 0x%lx\n", main_image.entry_point);
 	boot(argc - 1, argv + 1, envp, envp_end, main_image.entry_point, main_image.is_lc_main);
-
 }
+
