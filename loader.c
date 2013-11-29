@@ -201,6 +201,8 @@ int load_segment(struct mach_image *image, struct segment_command_64 *seg_comman
 		image->link_edit_base = load_addr - seg_command->fileoff;
 	}
 
+	// this has been replaced by a kernel module
+#if 0
 	// patch syscall
 	if (strcmp(seg_command->segname, SEG_TEXT) == 0) {
 		mprotect(segment, seg_command->vmsize, seg_command->initprot | PROT_WRITE);
@@ -243,6 +245,7 @@ int load_segment(struct mach_image *image, struct segment_command_64 *seg_comman
 
 		mprotect(segment, seg_command->vmsize, seg_command->initprot);
 	}
+#endif
 
 	return 0;
 }
