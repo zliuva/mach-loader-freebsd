@@ -1,7 +1,7 @@
 CC = clang
 AS = as
 CPPFLAGS = -I./include
-# CPPFLAGS += -DUSE_BSD_LIBS
+CPPFLAGS += -DUSE_BSD_LIBS
 CFLAGS = -std=c99
 LDFLAGS = -lm -lpthread
 
@@ -38,8 +38,12 @@ run_all: loader
 		fi\
 	done
 
+kmod:
+	make -f loader.kmod.mk
+
 clean:
 	rm -f loader
 	rm -f *.o
 	rm -f *.core
+	make -f loader.kmod.mk clean
 

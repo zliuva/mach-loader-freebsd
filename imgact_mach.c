@@ -1,0 +1,148 @@
+/*-
+ * Copyright (c) 1993, David Greenman
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+
+#include <sys/cdefs.h>
+__FBSDID("$FreeBSD: stable/10/sys/kern/imgact_mach.c 219352 2011-03-06 22:59:30Z kib $");
+
+#include <sys/param.h>
+#include <sys/vnode.h>
+#include <sys/proc.h>
+#include <sys/sbuf.h>
+#include <sys/systm.h>
+#include <sys/sysproto.h>
+#include <sys/exec.h>
+#include <sys/imgact.h>
+#include <sys/kernel.h>
+
+#define MH_MAGIC_64		0xfeedfacf
+
+int exec_mach_imgact(struct image_params *imgp);
+
+/**
+ * Based on shell interpreter image activator.
+ */
+int exec_mach_imgact(struct image_params *imgp) {
+	const char *image_header = imgp->image_header;
+	const char *fname = NULL;
+	int error, offset;
+	size_t length;
+	struct vattr vattr;
+	struct sbuf *sname = NULL;
+
+	/* a mach image? */
+	if (((const uint32_t *)image_header)[0] != MH_MAGIC_64)
+		return (-1);
+
+	imgp->interpreted = 1;
+
+	/*
+	 * At this point we have the first page of the file mapped.
+	 * However, we don't know how far into the page the contents are
+	 * valid -- the actual file might be much shorter than the page.
+	 * So find out the file size.
+ 	 */
+	error = VOP_GETATTR(imgp->vp, &vattr, imgp->proc->p_ucred);
+	if (error)
+		return (error);
+
+	if (imgp->args->fname != NULL) {
+		fname = imgp->args->fname;
+		sname = NULL;
+	} else {
+		sname = sbuf_new_auto();
+		sbuf_printf(sname, "/dev/fd/%d", imgp->args->fd);
+		sbuf_finish(sname);
+		fname = sbuf_data(sname);
+	}
+
+	/*
+	 * We need to "pop" (remove) the present value of arg[0], and "push"
+	 * either two or three new values in the arg[] list.  To do this,
+	 * we first shift all the other values in the `begin_argv' area to
+	 * provide the exact amount of room for the values added.  Set up
+	 * `offset' as the number of bytes to be added to the `begin_argv'
+	 * area, and 'length' as the number of bytes being removed.
+	 */
+	offset = strlen(DYLD) + 1;			/* interpreter */
+	offset += strlen(fname) + 1;			/* fname of script */
+	length = (imgp->args->argc == 0) ? 0 :
+	    strlen(imgp->args->begin_argv) + 1;		/* bytes to delete */
+
+	if (offset > imgp->args->stringspace + length) {
+		if (sname != NULL)
+			sbuf_delete(sname);
+		return (E2BIG);
+	}
+
+	bcopy(imgp->args->begin_argv + length, imgp->args->begin_argv + offset,
+	    imgp->args->endp - (imgp->args->begin_argv + length));
+
+	offset -= length;		/* calculate actual adjustment */
+	imgp->args->begin_envv += offset;
+	imgp->args->endp += offset;
+	imgp->args->stringspace -= offset;
+
+	/*
+	 * If there was no arg[0] when we started, then the interpreter_name
+	 * is adding an argument (instead of replacing the arg[0] we started
+	 * with).  And we're always adding an argument when we include the
+	 * full pathname of the original script.
+	 */
+	if (imgp->args->argc == 0)
+		imgp->args->argc = 1;
+	imgp->args->argc++;
+
+	/*
+	 * The original arg[] list has been shifted appropriately.  Copy in
+	 * the interpreter name and options-string.
+	 */
+	length = strlen(DYLD);
+	bcopy(DYLD, imgp->args->begin_argv, length);
+	*(imgp->args->begin_argv + length) = '\0';
+	offset = length + 1;
+
+	/*
+	 * Finally, add the filename onto the end for the interpreter to
+	 * use and copy the interpreter's name to imgp->interpreter_name
+	 * for exec to use.
+	 */
+	error = copystr(fname, imgp->args->begin_argv + offset,
+	    imgp->args->stringspace, NULL);
+
+	if (error == 0)
+		imgp->interpreter_name = DYLD;
+
+	if (sname != NULL)
+		sbuf_delete(sname);
+	return (error);
+}
+
+/*
+ * Tell kern_execve.c about it, with a little help from the linker.
+ */
+static struct execsw mach_execsw = { exec_mach_imgact, "\xcf\xfa\xed\xfe" };
+EXEC_SET(mach_test, mach_execsw);
+
