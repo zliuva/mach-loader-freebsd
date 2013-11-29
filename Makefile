@@ -41,6 +41,12 @@ run_all: loader
 kmod:
 	make -f loader.kmod.mk
 
+run_kmod: kmod
+	-kldunload ./imgact_mach.ko
+	-kldload ./imgact_mach.ko
+	-test/hello_asm
+	-kldunload ./imgact_mach.ko
+
 clean:
 	rm -f loader
 	rm -f *.o

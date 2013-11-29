@@ -1,31 +1,8 @@
-/*-
- * Copyright (c) 1993, David Greenman
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
+/**
+ * based on the shell image activator
  */
 
 #include <sys/cdefs.h>
-__FBSDID("$FreeBSD: stable/10/sys/kern/imgact_mach.c 219352 2011-03-06 22:59:30Z kib $");
 
 #include <sys/param.h>
 #include <sys/vnode.h>
@@ -36,10 +13,31 @@ __FBSDID("$FreeBSD: stable/10/sys/kern/imgact_mach.c 219352 2011-03-06 22:59:30Z
 #include <sys/exec.h>
 #include <sys/imgact.h>
 #include <sys/kernel.h>
+#include <sys/sysent.h>
 
-#define MH_MAGIC_64		0xfeedfacf
+#include <machine/frame.h>
+
+#define MH_MAGIC_64				0xfeedfacf
+#define OSX_BSD_SYSCALL_MASK	0x02000000
+
+static struct sysentvec *elf64_freebsd_sysvec = NULL;
 
 int exec_mach_imgact(struct image_params *imgp);
+int mach_fetch_syscall_args(struct thread *td, struct syscall_args *sa);
+
+/**
+ * patch the syscall (remove high byte)
+ */
+int mach_fetch_syscall_args(struct thread *td, struct syscall_args *sa) {
+	struct trapframe *frame = td->td_frame;
+
+	if (frame->tf_rax & OSX_BSD_SYSCALL_MASK) {
+		//uprintf("Patching syscall: 0x%lx -> 0x%lx\n", frame->tf_rax, frame->tf_rax & ~OSX_BSD_SYSCALL_MASK);
+		frame->tf_rax &= ~OSX_BSD_SYSCALL_MASK;
+	}
+
+	return cpu_fetch_syscall_args(td, sa);
+}
 
 /**
  * Based on shell interpreter image activator.
@@ -137,6 +135,19 @@ int exec_mach_imgact(struct image_params *imgp) {
 
 	if (sname != NULL)
 		sbuf_delete(sname);
+
+	/**
+	 * note that at this point we've just been fork'd
+	 * thus imgp->proc->p_sysent was inherited from the parent
+	 * and points to the native sysvec elf64_freebsd_sysvec
+	 *
+	 * this changes sv_fetch_syscall_args for ALL native ELFs since the sysvec is shared
+	 */
+	if (!elf64_freebsd_sysvec) {
+		elf64_freebsd_sysvec = imgp->proc->p_sysent;
+		elf64_freebsd_sysvec->sv_fetch_syscall_args = mach_fetch_syscall_args;
+	}
+
 	return (error);
 }
 
@@ -144,5 +155,42 @@ int exec_mach_imgact(struct image_params *imgp) {
  * Tell kern_execve.c about it, with a little help from the linker.
  */
 static struct execsw mach_execsw = { exec_mach_imgact, "\xcf\xfa\xed\xfe" };
-EXEC_SET(mach_test, mach_execsw);
+
+static int mach_imgact_modevent(module_t mod, int type, void *data) {
+	struct execsw *exec = (struct execsw *)data;
+	int error = 0;
+	switch (type) {
+		case MOD_LOAD:
+			error = exec_register(exec);
+			if (error)
+				printf("mach_imgact register failed\n");
+			break;
+			
+		case MOD_UNLOAD:
+			error = exec_unregister(exec);
+
+			// don't forget to reset sv_fetch_syscall_args
+			// or else it'll point to invalid address once we unload
+			if (elf64_freebsd_sysvec) {
+				elf64_freebsd_sysvec->sv_fetch_syscall_args = cpu_fetch_syscall_args;
+			}
+
+			if (error)
+				printf("mach_imgact unregister failed\n");
+			break;
+
+		default:
+			error = EOPNOTSUPP;
+			break;
+	}
+	return error;
+}
+
+static moduledata_t mach_imgact_mod = {
+	"mach_imgact",
+	mach_imgact_modevent,
+	(void *)&mach_execsw
+};
+
+DECLARE_MODULE_TIED(mach_imgact, mach_imgact_mod, SI_SUB_EXEC, SI_ORDER_ANY);
 
