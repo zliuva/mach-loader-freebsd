@@ -1,8 +1,9 @@
 CC = clang
 AS = as
-CPPFLAGS = -I./include -DUSE_BSD_LIBS
+CPPFLAGS = -I./include
+# CPPFLAGS += -DUSE_BSD_LIBS
 CFLAGS = -std=c99
-LDFLAGS = -lm
+LDFLAGS = -lm -lpthread
 
 .if defined(DEBUG) || make(debug)
 CFLAGS += -O0 -g

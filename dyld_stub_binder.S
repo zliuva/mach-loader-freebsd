@@ -96,7 +96,7 @@ L2:	vmovdqu		%ymm0,YMM0_SAVE(%rsp)	# stack is only 16-byte aligned, so must use 
 */
 L3:
 dyld_stub_binder_:
-	movq		MH_PARAM_BP(%rbp),%rdi	# call fastBindLazySymbol(loadercache, lazyinfo)
+	movq		MH_PARAM_BP(%rbp),%rdi	# call dyld_stub_binder_impl(image_cache, lazyinfo)
 	movq		LP_PARAM_BP(%rbp),%rsi
 	call		dyld_stub_binder_impl
 	movq		%rax,%r11		# save target

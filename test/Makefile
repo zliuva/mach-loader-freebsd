@@ -1,5 +1,5 @@
 CC = cc
-CFLAGS = -mmacosx-version-min=10.7
+CFLAGS = -mmacosx-version-min=10.8
 LDFLAGS = -macosx_version_min 10.7
 AS = as
 LD = ld
