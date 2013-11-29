@@ -1,7 +1,7 @@
 CC = clang
 AS = as
 CPPFLAGS = -I./include
-# CPPFLAGS += -DUSE_BSD_LIBS
+CPPFLAGS += -DUSE_BSD_LIBS
 CFLAGS = -std=c99
 LDFLAGS = -lm -lpthread
 

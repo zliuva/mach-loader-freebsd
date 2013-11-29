@@ -351,15 +351,18 @@ uint64_t bind_symbol(uint64_t *vmaddr, const char *symbol_name) {
 	if (!symbol_ptr) {
 		IMPL(_compat_mode, compat_mode);
 
-		REPLACE(___strlcpy_chk, strlcpy);
-		REPLACE(___snprintf_chk, snprintf);
-		REPLACE(_fstat$INODE64, fstat);
-		REPLACE(_stat$INODE64, stat);
-		REPLACE(_lstat$INODE64, lstat);
+		IMPL(_stat$INODE64, stat$INODE64);
+		IMPL(_lstat$INODE64, lstat$INODE64);
 		REPLACE(_fts_open$INODE64, fts_open);
 		REPLACE(_fts_read$INODE64, fts_read);
 		REPLACE(_fts_close$INODE64, fts_close);
+		/*REPLACE(_fstat$INODE64, fstat);
+		REPLACE(_fts_open$INODE64, fts_open);
+		REPLACE(_fts_read$INODE64, fts_read);
+		REPLACE(_fts_close$INODE64, fts_close);*/
 
+		REPLACE(___strlcpy_chk, strlcpy);
+		REPLACE(___snprintf_chk, snprintf);
 	}
 #endif
 
