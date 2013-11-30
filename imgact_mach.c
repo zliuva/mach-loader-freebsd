@@ -14,11 +14,18 @@
 #include <sys/imgact.h>
 #include <sys/kernel.h>
 #include <sys/sysent.h>
+#include <sys/syscall.h>
 
 #include <machine/frame.h>
 
-#define MH_MAGIC_64				0xfeedfacf
+#define MH_MAGIC_64	0xfeedfacf
+
+#define FAT_MAGIC   0xcafebabe
+#define FAT_CIGAM   0xbebafeca  /* NXSwapLong(FAT_MAGIC) */
+
 #define OSX_BSD_SYSCALL_MASK	0x02000000
+
+#define PSEUDO_SYS_set_proc_name	0xFFFFFFFF
 
 static struct sysentvec *elf64_freebsd_sysvec = NULL;
 
@@ -31,6 +38,14 @@ int mach_fetch_syscall_args(struct thread *td, struct syscall_args *sa);
 int mach_fetch_syscall_args(struct thread *td, struct syscall_args *sa) {
 	struct trapframe *frame = td->td_frame;
 
+	// we need this hack because the ELF image activator is called after us (since interpreted == 1)
+	// do_execve will therefore set p->p_comm as the interpreter
+	// loader will do this pseduo syscall with the desired command
+	if (frame->tf_rax == PSEUDO_SYS_set_proc_name) {
+		copyinstr((void *) frame->tf_rdi, td->td_proc->p_comm, MAXCOMLEN, NULL);
+		return EJUSTRETURN; // this tells sv_set_syscall_retval handler to just return instread of retry
+	}
+
 	if (frame->tf_rax & OSX_BSD_SYSCALL_MASK) {
 		//uprintf("Patching syscall: 0x%lx -> 0x%lx\n", frame->tf_rax, frame->tf_rax & ~OSX_BSD_SYSCALL_MASK);
 		frame->tf_rax &= ~OSX_BSD_SYSCALL_MASK;
@@ -39,102 +54,18 @@ int mach_fetch_syscall_args(struct thread *td, struct syscall_args *sa) {
 	return cpu_fetch_syscall_args(td, sa);
 }
 
-/**
- * Based on shell interpreter image activator.
- */
 int exec_mach_imgact(struct image_params *imgp) {
 	const char *image_header = imgp->image_header;
-	const char *fname = NULL;
-	int error, offset;
-	size_t length;
-	struct vattr vattr;
-	struct sbuf *sname = NULL;
+	const uint32_t magic = *((const uint32_t *) image_header);
 
-	/* a mach image? */
-	if (((const uint32_t *)image_header)[0] != MH_MAGIC_64)
-		return (-1);
+	if (magic != MH_MAGIC_64 &&
+		magic != FAT_MAGIC &&
+		magic != FAT_CIGAM) {
+		return -1;
+	}
 
 	imgp->interpreted = 1;
-
-	/*
-	 * At this point we have the first page of the file mapped.
-	 * However, we don't know how far into the page the contents are
-	 * valid -- the actual file might be much shorter than the page.
-	 * So find out the file size.
- 	 */
-	error = VOP_GETATTR(imgp->vp, &vattr, imgp->proc->p_ucred);
-	if (error)
-		return (error);
-
-	if (imgp->args->fname != NULL) {
-		fname = imgp->args->fname;
-		sname = NULL;
-	} else {
-		sname = sbuf_new_auto();
-		sbuf_printf(sname, "/dev/fd/%d", imgp->args->fd);
-		sbuf_finish(sname);
-		fname = sbuf_data(sname);
-	}
-
-	/*
-	 * We need to "pop" (remove) the present value of arg[0], and "push"
-	 * either two or three new values in the arg[] list.  To do this,
-	 * we first shift all the other values in the `begin_argv' area to
-	 * provide the exact amount of room for the values added.  Set up
-	 * `offset' as the number of bytes to be added to the `begin_argv'
-	 * area, and 'length' as the number of bytes being removed.
-	 */
-	offset = strlen(DYLD) + 1;			/* interpreter */
-	offset += strlen(fname) + 1;			/* fname of script */
-	length = (imgp->args->argc == 0) ? 0 :
-	    strlen(imgp->args->begin_argv) + 1;		/* bytes to delete */
-
-	if (offset > imgp->args->stringspace + length) {
-		if (sname != NULL)
-			sbuf_delete(sname);
-		return (E2BIG);
-	}
-
-	bcopy(imgp->args->begin_argv + length, imgp->args->begin_argv + offset,
-	    imgp->args->endp - (imgp->args->begin_argv + length));
-
-	offset -= length;		/* calculate actual adjustment */
-	imgp->args->begin_envv += offset;
-	imgp->args->endp += offset;
-	imgp->args->stringspace -= offset;
-
-	/*
-	 * If there was no arg[0] when we started, then the interpreter_name
-	 * is adding an argument (instead of replacing the arg[0] we started
-	 * with).  And we're always adding an argument when we include the
-	 * full pathname of the original script.
-	 */
-	if (imgp->args->argc == 0)
-		imgp->args->argc = 1;
-	imgp->args->argc++;
-
-	/*
-	 * The original arg[] list has been shifted appropriately.  Copy in
-	 * the interpreter name and options-string.
-	 */
-	length = strlen(DYLD);
-	bcopy(DYLD, imgp->args->begin_argv, length);
-	*(imgp->args->begin_argv + length) = '\0';
-	offset = length + 1;
-
-	/*
-	 * Finally, add the filename onto the end for the interpreter to
-	 * use and copy the interpreter's name to imgp->interpreter_name
-	 * for exec to use.
-	 */
-	error = copystr(fname, imgp->args->begin_argv + offset,
-	    imgp->args->stringspace, NULL);
-
-	if (error == 0)
-		imgp->interpreter_name = DYLD;
-
-	if (sname != NULL)
-		sbuf_delete(sname);
+	imgp->interpreter_name = DYLD;
 
 	/**
 	 * note that at this point we've just been fork'd
@@ -148,13 +79,13 @@ int exec_mach_imgact(struct image_params *imgp) {
 		elf64_freebsd_sysvec->sv_fetch_syscall_args = mach_fetch_syscall_args;
 	}
 
-	return (error);
+	return 0;
 }
 
 /*
  * Tell kern_execve.c about it, with a little help from the linker.
  */
-static struct execsw mach_execsw = { exec_mach_imgact, "\xcf\xfa\xed\xfe" };
+static struct execsw mach_execsw = { exec_mach_imgact, "Mach-O" };
 
 static int mach_imgact_modevent(module_t mod, int type, void *data) {
 	struct execsw *exec = (struct execsw *)data;

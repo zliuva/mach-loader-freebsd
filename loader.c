@@ -70,6 +70,7 @@ static uint64_t highest_addr = 0; // the highest address mapped so far
 
 extern void boot(uint64_t argc, char **argv, char **envp, char **envp_end, uint64_t entry, uint64_t is_lc_main);
 extern void dyld_stub_binder(void);
+extern void set_proc_comm(const char *comm);
 
 static uint64_t read_uleb128(const uint8_t** p, const uint8_t* end) {
 	uint64_t result = 0;
@@ -822,8 +823,20 @@ void load_mach_image(struct mach_image *image) {
 }
 
 int main(int argc, char **argv, char **envp) {
+	uint32_t magic;
+
+	int fd = open(argv[0], O_RDONLY);
+	read(fd, &magic, sizeof(uint32_t));
+	close(fd);
+
+	bool loaded_by_kernel = (magic != 0x464c457f);
+
+	if (loaded_by_kernel) {
+		set_proc_comm(basename(argv[0])); // fix the "command" reported by utilities such as top
+	}
+
 	struct mach_image main_image;
-	main_image.path = argv[1];
+	main_image.path = loaded_by_kernel ? argv[0] : argv[1];
 
 	load_mach_image(&main_image);
 	
@@ -831,6 +844,8 @@ int main(int argc, char **argv, char **envp) {
 	while (*envp_end) envp_end++;
 
 	LOGF("jumping to entry point: 0x%lx\n", main_image.entry_point);
-	boot(argc - 1, argv + 1, envp, envp_end, main_image.entry_point, main_image.is_lc_main);
+	boot(loaded_by_kernel ? argc : argc - 1,
+		 loaded_by_kernel ? argv : argv + 1,
+		 envp, envp_end, main_image.entry_point, main_image.is_lc_main);
 }
 

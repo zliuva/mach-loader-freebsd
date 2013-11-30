@@ -14,9 +14,10 @@ CFLAGS += -O3 -DNDEBUG
 debug: all
 all: loader
 
-loader: loader.c osx_compat.h boot.o dyld_stub_binder.o
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< boot.o dyld_stub_binder.o
+loader: loader.c osx_compat.h boot.o dyld_stub_binder.o set_proc_comm.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< boot.o dyld_stub_binder.o set_proc_comm.o
 
+set_proc_comm.o: set_proc_comm.s
 boot.o: boot.s
 	$(AS) -o $@ $<
 
