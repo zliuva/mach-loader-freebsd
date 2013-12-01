@@ -52,5 +52,8 @@ clean:
 	rm -f loader
 	rm -f *.o
 	rm -f *.core
+	rm -f *.tar.gz
 	make -f loader.kmod.mk clean
-
+	
+archive:
+	git archive --prefix=mach-loader-freebsd/ --format tar HEAD | gzip -9 > mach-loader-freebsd-`git log -1 --format='%h'`.tar.gz
